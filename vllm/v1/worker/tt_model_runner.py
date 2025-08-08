@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import ttnn
@@ -14,9 +14,12 @@ from vllm.utils import LayerBlockType
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 from vllm.v1.worker.tt_input_batch import CachedRequestState, InputBatch
+from vllm.worker.tt_model_runner import TTModelInput, TTSamplingParams
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+import numpy as np
 
 logger = init_logger(__name__)
 
@@ -258,8 +261,98 @@ class TTModelRunner:
         if removed_req_indices:
             self.input_batch.condense(removed_req_indices)
 
-    def _prepare_model_inputs(self, scheduler_output: "SchedulerOutput"):
-        raise NotImplementedError
+    def _prepare_model_inputs(
+            self, scheduler_output: "SchedulerOutput") -> TTModelInput:
+
+        assert scheduler_output.total_num_scheduled_tokens > 0
+        input_batch = self.input_batch
+        num_reqs = input_batch.num_reqs
+        assert num_reqs > 0
+        assert (len(input_batch.block_table.block_tables) == 1
+                ), "Currently only supporting 1 KV cache group"
+
+        # Second dim of block table kept as fixed size max_num_blocks_per_req
+        # (ceil(max_model_len / block_size)) so ttnn tracing can work
+        # (requires constant shape).
+        block_tables = input_batch.block_table[0].get_cpu_tensor(
+        )[:num_reqs, :]
+
+        # NOTE: We assume that all sequences in the group are all prompts or
+        # all decodes.
+        is_prompt = len(scheduler_output.scheduled_new_reqs) > 0
+        if is_prompt:
+            # Assert no running requests
+            assert (
+                len(scheduler_output.scheduled_cached_reqs.req_ids) == 0
+            ), "Currently only supporting all prefills or all decodes in batch"
+
+            input_positions = 0
+            max_prompt_tokens = max(input_batch.num_prompt_tokens[:num_reqs])
+            input_tokens = input_batch.token_ids_cpu_tensor[:num_reqs, :
+                                                            max_prompt_tokens]
+            prompt_lens = input_batch.num_prompt_tokens[:num_reqs]
+        else:
+            input_positions = input_batch.num_tokens[:num_reqs] - 1
+            input_tokens = input_batch.token_ids_cpu_tensor[
+                torch.arange(num_reqs), input_positions].view(-1, 1)
+            prompt_lens = None
+
+            # TODO: Remove once TT models can support arbitrary batch sizes.
+            # Pad batch to max_num_reqs.
+            if input_tokens.shape[0] < input_batch.max_num_reqs:
+                batch_pad = input_batch.max_num_reqs - input_tokens.shape[0]
+                input_tokens = torch.cat([
+                    input_tokens,
+                    torch.zeros(batch_pad, 1, dtype=torch.int32)
+                ])
+                # Pad positions with -1 to indicate no position
+                input_positions = torch.cat([
+                    input_positions,
+                    torch.ones(batch_pad, dtype=torch.int32) * -1
+                ])
+                block_tables = torch.cat([
+                    block_tables,
+                    torch.zeros(batch_pad,
+                                block_tables.shape[1],
+                                dtype=torch.int32)
+                ])
+
+        # Sampling-related.
+        temperature = input_batch.sampling.temperature_cpu[:num_reqs]
+        top_p = input_batch.sampling.top_p_cpu[:num_reqs]
+        top_k = input_batch.sampling.top_k_cpu[:num_reqs]
+        if not np.all(temperature == temperature[0]):
+            logger.warning(
+                "Currently only supporting same temperature for all "
+                "sequences in batch, falling back to first sequence's "
+                "temperature (%s)", temperature[0])
+        if not np.all(top_k == top_k[0]):
+            logger.warning(
+                "Currently only supporting same top_k"
+                "for all sequences in batch, "
+                "falling back to first sequence's top_k (%s)", top_k[0])
+        if not np.all(top_p == top_p[0]):
+            logger.warning(
+                "Currently only supporting same top_p"
+                "for all sequences in batch, "
+                "falling back to first sequence's top_p (%s)", top_p[0])
+        tt_sampling_params = TTSamplingParams(
+            temperature=temperature[0],
+            top_k=top_k[0],
+            top_p=top_p[0],
+        )
+
+        # TODO: Add multi-modal support
+        multi_modal_kwargs: Dict[str, Any] = {}
+        # TODO: Add support for encoder-decoder models
+        cross_block_tables = None
+
+        seq_groups_list = None  # TODO: maybe remove
+
+        return TTModelInput(input_tokens, input_positions, prompt_lens,
+                            seq_groups_list, block_tables, num_reqs,
+                            tt_sampling_params, multi_modal_kwargs,
+                            cross_block_tables)
 
     @torch.no_grad()
     def execute_model(
@@ -275,6 +368,50 @@ class TTModelRunner:
             # Return empty ModelRunnerOutput if there's no work to do.
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        model_inputs = self._prepare_model_inputs(scheduler_output)
+        # Prepare model inputs
+        model_input = self._prepare_model_inputs(scheduler_output)
+        is_decode = model_input.prompt_lens is None
+        execute_model_kwargs = {
+            "tokens": model_input.input_tokens,
+            "page_table": model_input.block_tables,
+            "kv_cache": self.kv_caches,
+            **(model_input.multi_modal_kwargs or {}),
+        }
+        if not is_decode:
+            execute_model_kwargs["prompt_lens"] = model_input.prompt_lens
+        else:
+            execute_model_kwargs["start_pos"] = model_input.input_positions
+        if self.sample_on_device_mode == "all" or (
+                self.sample_on_device_mode == "decode_only" and is_decode):
+            execute_model_kwargs[
+                "sampling_params"] = model_input.tt_sampling_params
 
-        raise NotImplementedError
+        # Execute model
+        if not is_decode:
+            outputs = self.model.prefill_forward(**execute_model_kwargs)
+            tt_out = outputs  # [batch_size, seq_len, vocab_size]
+        else:
+            enc_dec_kwargs = {}  # TODO: Add encoder-decoder support
+            tt_out = self.model.decode_forward(**execute_model_kwargs,
+                                               **enc_dec_kwargs,
+                                               enable_trace=self.trace_mode,
+                                               read_from_device=False)
+
+            tt_out = self.model.read_decode_output(
+                tt_out,
+                model_input.unpadded_batch_size,
+                is_tokens=(self.sample_on_device_mode is not None))
+
+        if not self.sample_on_device_mode or (
+                self.sample_on_device_mode == "decode_only" and not is_decode):
+            next_logits = tt_out[:model_input.unpadded_batch_size,
+                                 -1, :]  # unpadded batch, vocab of last token
+            next_token_ids = self._sample_tokens(
+                next_logits, model_input.tt_sampling_params)
+        else:
+            if self.llama_tg:
+                next_token_ids = tt_out
+            else:
+                next_token_ids = tt_out[:model_input.unpadded_batch_size]
+
+        breakpoint()
